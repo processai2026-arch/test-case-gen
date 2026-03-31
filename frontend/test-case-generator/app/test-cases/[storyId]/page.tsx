@@ -53,9 +53,32 @@ export default function StoryTestCasesPage() {
     const fetchData = async () => {
       try {
         setLoading(true);
+        // Important: always log the raw payload to validate API URL + response shape
+        console.debug("[test-cases page] fetching testcases", { storyId });
         const response = await api.getTestCases(storyId);
-        setTestCases(response.testcases);
-        setStoryDescription(response.storyDescription);
+        console.debug("[test-cases page] getTestCases response", response);
+
+        // Backend is expected to return { testcases: [...] }.
+        // Guard against undefined / wrong shape to avoid rendering silently failing.
+        const rawTestcases = (response as any)?.testcases;
+        const normalizedTestcases = Array.isArray(rawTestcases) ? rawTestcases : [];
+        if (!Array.isArray(rawTestcases)) {
+          console.warn("[test-cases page] response.testcases is not an array", {
+            receivedType: typeof rawTestcases,
+          });
+          if (rawTestcases === undefined) {
+            setError("Invalid API response: 'testcases' field is missing");
+          } else {
+            setError("Invalid API response: 'testcases' field is not an array");
+          }
+        }
+
+        setTestCases(normalizedTestcases);
+        setStoryDescription((response as any)?.storyDescription ?? null);
+
+        if ((response as any)?.error) {
+          setError(String((response as any).error));
+        }
         // Fetch story content
         const storyResponse = await fetch(`http://127.0.0.1:5000/api/stories/${storyId}`);
         if (storyResponse.ok) {
@@ -67,6 +90,7 @@ export default function StoryTestCasesPage() {
           console.error('Failed to fetch story:', storyResponse.status);
         }
       } catch (err) {
+        console.error("[test-cases page] fetchData failed", err);
         setError(err instanceof Error ? err.message : 'Failed to fetch test cases');
       } finally {
         setLoading(false);
@@ -218,10 +242,10 @@ export default function StoryTestCasesPage() {
       <header className="fixed top-0 left-0 w-full z-50 bg-background shadow-sm border-b border-border px-4 md:px-8 py-4">
         <div className="flex justify-between items-center">
           <div className="flex-shrink-0">
-            <img src="/Logo-New.svg" alt="Innova Solutions" className="h-12 w-auto" />
+            <img src="" alt="" className="h-12 w-auto" />
           </div>
           <div className="text-center">
-            <h1 className="text-3xl font-bold text-primary">Test Forge AI</h1>
+            <h1 className="text-3xl font-bold text-primary">Test Case Generation</h1>
             <p className="text-sm text-muted-foreground font-semibold mt-1">Powered by Gen AI</p>
           </div>
           <div className="flex-shrink-0 flex items-center space-x-4">
@@ -231,15 +255,7 @@ export default function StoryTestCasesPage() {
               </div>
               <div className="text-sm text-muted-foreground">{new Date().toLocaleDateString()}</div>
             </div>
-            <div className="bg-blue-500 text-white px-4 py-2 rounded-full flex items-center space-x-2">
-              <div className="w-6 h-6 bg-white/20 rounded-full flex items-center justify-center">
-                <Triangle className="h-3 w-3 fill-white" />
-              </div>
-              <div className="text-sm font-bold">
-                <div className="text-xs opacity-90">Team</div>
-                <div>DELTA</div>
-              </div>
-            </div>
+            
           </div>
         </div>
       </header>

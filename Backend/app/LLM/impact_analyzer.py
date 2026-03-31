@@ -1,4 +1,6 @@
 import json
+from urllib import response
+from urllib import response
 import uuid
 from datetime import datetime, timedelta
 import lancedb
@@ -33,7 +35,7 @@ logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
 # Load the LLM prompt for impact analysis
-with open("Backend/app/LLM/impact_analysis_prompt.txt", "r", encoding="utf-8") as f:
+with open("app/LLM/impact_analysis_prompt.txt", "r", encoding="utf-8") as f:
     IMPACT_INSTRUCTIONS = f.read()
 
 # Constants for rate limiting and retries
@@ -143,7 +145,13 @@ Just return the raw JSON object.
         
         # Get response from LLM
         response = llm_ref.invoke(structured_prompt)
-        content = response.content.strip()
+
+        if hasattr(response, "content"):
+            content = str(response.content).strip()
+        else:
+            content = str(response).strip()
+            
+        logger.info(f"LLM Response: {content[:500]}")
         
         # Clean up the response
         if "```json" in content:
@@ -165,18 +173,53 @@ Just return the raw JSON object.
         
         try:
             result = json.loads(content)
-            
-            # Validate required fields
-            if not isinstance(result.get("has_impact"), bool):
+
+            # --- NORMALIZE COMMON LLM VARIANTS BEFORE STRICT VALIDATION ---
+            # Some models might use "impacts" instead of "impacted_test_cases"
+            if "impacted_test_cases" not in result and isinstance(result.get("impacts"), list):
+                logger.info("Normalizing LLM field 'impacts' -> 'impacted_test_cases'")
+                result["impacted_test_cases"] = result["impacts"]
+
+            # If has_impact missing but we clearly have impacted_test_cases, infer it
+            if "has_impact" not in result and result.get("impacted_test_cases"):
+                logger.info("Inferring has_impact=True from non-empty impacted_test_cases")
+                result["has_impact"] = True
+
+            # Default impact_type if missing but we have impacts
+            if "impact_type" not in result and result.get("impacted_test_cases"):
+                logger.info("Defaulting impact_type='MODIFY' because impacts are present")
+                result["impact_type"] = "MODIFY"
+
+            # Validate required fields (tolerant to typing issues)
+            raw_has_impact = result.get("has_impact", False)
+            if isinstance(raw_has_impact, str):
+                normalized = raw_has_impact.strip().lower()
+                if normalized in ["true", "1", "yes", "y"]:
+                    result["has_impact"] = True
+                elif normalized in ["false", "0", "no", "n"]:
+                    result["has_impact"] = False
+                else:
+                    raise ValueError("has_impact must be a boolean (or a boolean-like string)")
+            elif not isinstance(raw_has_impact, bool):
                 raise ValueError("has_impact must be a boolean")
-                
-            if result.get("impact_type") not in ["MODIFY", "NO_IMPACT"]:
+
+            impact_type = result.get("impact_type", "NO_IMPACT")
+            if isinstance(impact_type, str):
+                impact_type_norm = impact_type.strip().upper()
+            else:
+                impact_type_norm = impact_type
+
+            if impact_type_norm not in ["MODIFY", "NO_IMPACT"]:
                 raise ValueError("impact_type must be either 'MODIFY' or 'NO_IMPACT'")
-                
-            if not isinstance(result.get("impacted_test_cases", []), list):
+            result["impact_type"] = impact_type_norm
+
+            impacted_list = result.get("impacted_test_cases", [])
+            if not isinstance(impacted_list, list):
                 raise ValueError("impacted_test_cases must be a list")
+            # Normalize missing/nullable lists to []
+            result["impacted_test_cases"] = impacted_list or []
                 
-            # If we have impacts, validate each test case
+            # If we have impacts, validate each test case (do not assume strict typing)
             if result["has_impact"] and result["impact_type"] == "MODIFY":
                 for test_case in result["impacted_test_cases"]:
                     if not isinstance(test_case.get("original_test_case_id"), str):
@@ -185,8 +228,19 @@ Just return the raw JSON object.
                         raise ValueError("modification_reason must be a string")
                     if not isinstance(test_case.get("modified_test_case"), dict):
                         raise ValueError("modified_test_case must be an object")
-                        
+
                     modified = test_case["modified_test_case"]
+
+                    # Normalize priority/steps coming from LLM
+                    if isinstance(modified.get("priority"), str):
+                        pr_norm = modified["priority"].strip().lower()
+                        pr_map = {"high": "High", "medium": "Medium", "low": "Low"}
+                        if pr_norm in pr_map:
+                            modified["priority"] = pr_map[pr_norm]
+                    if isinstance(modified.get("steps"), str):
+                        # If model returned a single string instead of a list, wrap it.
+                        modified["steps"] = [modified["steps"]]
+
                     if not all(isinstance(modified.get(field), str) for field in ["id", "title", "expected_result"]):
                         raise ValueError("modified_test_case fields must be strings")
                     if not isinstance(modified.get("steps"), list):
@@ -194,6 +248,8 @@ Just return the raw JSON object.
                     if modified.get("priority") not in ["High", "Medium", "Low"]:
                         raise ValueError("priority must be High, Medium, or Low")
             
+            # Final normalization: ensure has_impact and impact_type are correct types
+            result["has_impact"] = bool(result["has_impact"])
             return result
             
         except json.JSONDecodeError as e:
@@ -336,7 +392,27 @@ def store_impact_analysis(
                         priority,
                         json.dumps(impact_details)
                     ))
-                    
+
+                    inserted_impact_id = cur.fetchone()[0]
+                    # Keep impact_history linked for traceability/auditing
+                    cur.execute("""
+                        INSERT INTO impact_history (
+                            history_id,
+                            impact_id,
+                            changed_by,
+                            previous_status,
+                            new_status,
+                            change_reason
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (
+                        str(uuid.uuid4()),
+                        inserted_impact_id,
+                        'system',
+                        None,
+                        'active',
+                        'Initial impact analysis creation'
+                    ))
+
                     impacts_stored += 1
                 
                 if impacts_stored > 0:
@@ -381,10 +457,61 @@ def analyze_test_case_impacts(new_story_id: str, project_id: str, existing_story
         llm_ref: Optional LLM reference
     """
     if llm_ref is None:
-        llm_ref = Config.llm
+        llm_ref = Config.llm_impact
         
     try:
         db_service = get_db_service()
+
+        # Ensure required DB schema exists for impacts + history
+        conn_schema = psycopg2.connect(**Config.postgres_config())
+        with conn_schema:
+            with conn_schema.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS test_case_impacts (
+                        impact_id UUID PRIMARY KEY,
+                        project_id TEXT NOT NULL,
+                        new_story_id TEXT NOT NULL,
+                        original_story_id TEXT NOT NULL,
+                        original_test_case_id TEXT NOT NULL,
+                        modified_test_case_id TEXT NOT NULL,
+                        original_run_id UUID NOT NULL,
+                        impact_created_on TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                        source TEXT DEFAULT 'backend',
+                        similarity_score FLOAT,
+                        impact_analysis_json JSONB NOT NULL,
+                        previous_impact_id UUID,
+                        impact_version INT DEFAULT 1,
+                        impact_status TEXT DEFAULT 'active',
+                        impact_type TEXT NOT NULL,
+                        impact_severity TEXT NOT NULL,
+                        impact_priority INTEGER,
+                        impact_details JSONB
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS impact_history (
+                        history_id UUID PRIMARY KEY,
+                        impact_id UUID NOT NULL,
+                        change_timestamp TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                        changed_by TEXT,
+                        previous_status TEXT,
+                        new_status TEXT,
+                        change_reason TEXT
+                    );
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_test_case_impacts_original_story
+                    ON test_case_impacts(original_story_id);
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_test_case_impacts_project
+                    ON test_case_impacts(project_id);
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_impact_history_impact_id
+                    ON impact_history(impact_id);
+                """)
+        conn_schema.close()
         
         # First check if stories have test cases generated
         conn = psycopg2.connect(**Config.postgres_config())
@@ -430,31 +557,95 @@ def analyze_test_case_impacts(new_story_id: str, project_id: str, existing_story
             
         logger.info(f"Analyzing impacts for {new_story_id} against {len(stories_to_analyze)} stories from project {project_id}")
         
+        def normalize_test_case_json(tc_json):
+            """
+            Ensure we pass a dict like:
+              { "test_cases": [...] , ... }
+            to the LLM prompt.
+            """
+            if tc_json is None:
+                return None
+            if isinstance(tc_json, str):
+                try:
+                    return json.loads(tc_json)
+                except Exception:
+                    logger.warning("normalize_test_case_json: failed to json.loads string")
+                    return None
+            if isinstance(tc_json, dict):
+                return tc_json
+            logger.warning(f"normalize_test_case_json: unexpected type: {type(tc_json)}")
+            return None
+
         for existing_story in stories_to_analyze:
             try:
                 # Get test cases for both stories
-                new_test_cases = get_test_case_json_by_story_id(new_story_id)
-                existing_test_cases = get_test_case_json_by_story_id(existing_story["id"])
-                
-                if not new_test_cases or not existing_test_cases:
-                    logger.warning(f"Missing test cases for comparison between {new_story_id} and {existing_story['id']}")
+                new_test_cases = get_test_case_json_by_story_id(new_story_id, project_id=project_id)
+                existing_test_cases = get_test_case_json_by_story_id(existing_story["id"], project_id=project_id)
+
+                # Normalize (DB values may be stored as JSON strings or dicts)
+                normalized_new = normalize_test_case_json(new_test_cases)
+                normalized_existing = normalize_test_case_json(existing_test_cases)
+
+                if not normalized_new or not normalized_existing:
+                    logger.warning(
+                        "Missing/invalid test_case_json for comparison; skipping",
+                        extra={
+                            "new_story_id": new_story_id,
+                            "existing_story_id": existing_story["id"],
+                            "normalized_new_type": type(normalized_new),
+                            "normalized_existing_type": type(normalized_existing),
+                        },
+                    )
+                    continue
+
+                # LLM needs the list under test_cases
+                new_list = normalized_new.get("test_cases", [])
+                existing_list = normalized_existing.get("test_cases", [])
+                if not isinstance(new_list, list) or not isinstance(existing_list, list):
+                    logger.warning(
+                        "test_case_json missing 'test_cases' list; skipping",
+                        extra={
+                            "new_story_id": new_story_id,
+                            "existing_story_id": existing_story["id"],
+                            "new_list_type": type(new_list),
+                            "existing_list_type": type(existing_list),
+                        },
+                    )
                     continue
                     
                 # Prepare the prompt for impact analysis
+                # IMPORTANT: Truncate test cases to avoid exceeding LLM token limits.
+                # Only send id, title, expected_result (no full steps) and cap at 10 per story.
+                MAX_TCS_FOR_PROMPT = 10
+
+                def compact_tc_list(tc_list, max_count=MAX_TCS_FOR_PROMPT):
+                    """Return a compact summary list to avoid token limit errors."""
+                    result = []
+                    for tc in tc_list[:max_count]:
+                        result.append({
+                            "id": tc.get("id", tc.get("test_case_id", "")),
+                            "title": tc.get("title", ""),
+                            "expected_result": tc.get("expected_result", "")[:200]
+                        })
+                    return result
+
+                compact_new = compact_tc_list(new_list)
+                compact_existing = compact_tc_list(existing_list)
+
                 prompt = f"""
                 {IMPACT_INSTRUCTIONS}
                 
                 ORIGINAL STORY ({existing_story['id']} - Project: {project_id}):
-                {existing_story.get('description', 'No description available')}
+                {existing_story.get('description', 'No description available')[:500]}
                 
-                ORIGINAL TEST CASES:
-                {json.dumps(existing_test_cases, indent=2)}
+                ORIGINAL TEST CASES (summary, max {MAX_TCS_FOR_PROMPT}):
+                {json.dumps(compact_existing, indent=2)}
                 
                 NEW STORY ({new_story_id} - Project: {project_id}):
-                {new_story.get('description', 'No description available')}
+                {new_story.get('description', 'No description available')[:500]}
                 
-                NEW TEST CASES:
-                {json.dumps(new_test_cases, indent=2)}
+                NEW TEST CASES (summary, max {MAX_TCS_FOR_PROMPT}):
+                {json.dumps(compact_new, indent=2)}
                 """
                     
                 # Get impact analysis from LLM

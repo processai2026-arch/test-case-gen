@@ -28,7 +28,7 @@ BATCH_SIZE = 10  # Increased batch size for more efficient generation
 MAX_RETRIES = 3
 
 # Load prompt
-with open("Backend/app/LLM/test_case_prompt.txt", "r", encoding="utf-8") as f:
+with open("app/LLM/test_case_prompt.txt", "r", encoding="utf-8") as f:
     INSTRUCTIONS = f.read()
 
 class JSONResponseHandler:
@@ -509,31 +509,71 @@ async def _generate_test_cases_for_all_stories():
         await _generate_test_case_for_story(story_id)
 
 def Chat_RAG(user_query, top_k=3):
-    db = lancedb.connect(Config.LANCE_DB_PATH)
-    table = db.open_table(Config.TABLE_NAME_LANCE)
-    query_vector = Config.EMBEDDING_MODEL.encode(user_query).tolist()
+    """
+    Retrieve similar stories and their structured test cases for RAG.
+    Always returns a LIST of result objects so callers can iterate safely.
+    Each result has:
+      - story_id
+      - similarity_score
+      - test_case_json: dict with 'test_cases' list, or None when unavailable
+    """
+    try:
+        db = lancedb.connect(Config.LANCE_DB_PATH)
+        table = db.open_table(Config.TABLE_NAME_LANCE)
+        query_vector = Config.EMBEDDING_MODEL.encode(user_query).tolist()
 
-    results = (
-        table.search(query_vector)
-        .metric("cosine")
-        .limit(top_k)
-        .to_list()
-    )
+        results = (
+            table.search(query_vector)
+            .metric("cosine")
+            .limit(top_k)
+            .to_list()
+        )
 
-    if not results:
-        return {"error": "No relevant stories found."}
+        if not results:
+            # IMPORTANT: return an empty LIST, not a dict,
+            # so callers like /rag-chat don't crash when iterating.
+            print("Chat_RAG: no relevant stories found for query:", user_query)
+            return []
 
-    response = []
-    for result in results:
-        story_id = result["storyID"]
-        test_case_json = get_test_case_json_by_story_id(story_id)
-        response.append({
-            "story_id": story_id,
-            "similarity_score": result["_distance"],
-            "test_case_json": test_case_json or "[Test case not found]"
-        })
+        response = []
+        for result in results:
+            story_id = result.get("storyID")
+            similarity_score = result.get("_distance")
 
-    return response
+            raw_tc = get_test_case_json_by_story_id(story_id)
+            parsed_tc = None
+
+            # Normalize test_case_json to a dict with 'test_cases' when possible
+            if raw_tc:
+                try:
+                    if isinstance(raw_tc, str):
+                        parsed_tc = json.loads(raw_tc)
+                    elif isinstance(raw_tc, dict):
+                        parsed_tc = raw_tc
+                    else:
+                        print(f"Chat_RAG: unexpected test_case_json type for {story_id}: {type(raw_tc)}")
+
+                    # Only keep if it has the expected structure
+                    if parsed_tc is not None and "test_cases" not in parsed_tc:
+                        print(f"Chat_RAG: test_case_json for {story_id} missing 'test_cases' key")
+                        parsed_tc = None
+                except Exception as e:
+                    print(f"Chat_RAG: failed to parse test_case_json for {story_id}: {e}")
+                    parsed_tc = None
+
+            response.append({
+                "story_id": story_id,
+                "similarity_score": similarity_score,
+                "test_case_json": parsed_tc,  # None when not available/invalid
+            })
+
+        return response
+
+    except Exception as e:
+        # Stable failure mode: log and return empty list instead of raising,
+        # so the caller can handle "no context" gracefully.
+        print(f"Chat_RAG: unexpected error: {e}")
+        return []
 
 if __name__ == "__main__":
     # Run RAG search on a sample query

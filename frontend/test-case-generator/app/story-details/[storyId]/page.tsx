@@ -264,7 +264,7 @@ export default function StoryImpactAnalysisPage() {
       <header className="fixed top-0 left-0 w-full z-50 bg-background shadow-sm border-b border-border px-4 md:px-8 py-4">
         <div className="flex justify-between items-center">
           <div className="flex-shrink-0">
-            <img src="/Logo-New.svg" alt="Innova Solutions" className="h-12 w-auto" />
+            <img src="" alt="" className="h-12 w-auto" />
           </div>
           <div className="text-center">
             <h1 className="text-3xl font-bold text-primary">Test Forge AI</h1>
@@ -277,15 +277,7 @@ export default function StoryImpactAnalysisPage() {
               </div>
               <div className="text-sm text-muted-foreground">{new Date().toLocaleDateString()}</div>
             </div>
-            <div className="bg-blue-500 text-white px-4 py-2 rounded-full flex items-center space-x-2">
-              <div className="w-6 h-6 bg-white/20 rounded-full flex items-center justify-center">
-                <Triangle className="h-3 w-3 fill-white" />
-              </div>
-              <div className="text-sm font-bold">
-                <div className="text-xs opacity-90">Team</div>
-                <div>DELTA</div>
-              </div>
-            </div>
+
           </div>
         </div>
       </header>

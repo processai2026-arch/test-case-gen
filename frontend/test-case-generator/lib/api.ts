@@ -112,7 +112,9 @@ export const api = {
 
   // Fetch test cases for a story
   getTestCases: async (storyId: string) => {
-    const response = await fetchWithErrorHandling(`${API_BASE_URL}/api/stories/${storyId}/testcases`);
+    const url = `${API_BASE_URL}/api/stories/${storyId}/testcases`;
+    console.debug("[api] getTestCases url", { url, storyId });
+    const response = await fetchWithErrorHandling(url);
     return response.json();
   },
 

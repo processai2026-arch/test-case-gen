@@ -10,8 +10,9 @@ from app.config import Config
 load_dotenv()
 
 
-def get_test_case_json_by_story_id(story_id):
-    """Get test_case_json for a single story_id (used for context)."""
+def get_test_case_json_by_story_id(story_id, project_id=None):
+    """Get latest generated test_case_json for a story_id (optionally project-scoped)."""
+    conn = None
     try:
         conn = Config.get_postgres_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -20,9 +21,17 @@ def get_test_case_json_by_story_id(story_id):
                 FROM test_cases
                 WHERE story_id = %s
                 AND test_case_json IS NOT NULL
+                AND test_case_generated = TRUE
+            """
+            params = [story_id]
+            if project_id:
+                query += " AND project_id = %s"
+                params.append(project_id)
+            query += """
+                ORDER BY created_on DESC NULLS LAST
                 LIMIT 1
             """
-            cur.execute(query, (story_id,))
+            cur.execute(query, tuple(params))
             result = cur.fetchone()
             return result["test_case_json"] if result else None
     except Exception as e:

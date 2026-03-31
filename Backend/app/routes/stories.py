@@ -33,7 +33,7 @@ def get_stories():
         sort_order = request.args.get('sort_order', 'desc')
         project_id = request.args.get('project_id')
 
-        print("DEBUG: Fetching stories with params:", {
+        print("DEBUG:get_stories: Request received", {
             'page': page,
             'per_page': per_page,
             'sort_order': sort_order,
@@ -54,7 +54,7 @@ def get_stories():
                 test_case_generated,
                 created_on as test_case_created_time,
                 source,
-                impacted_test_cases_count as "impactedTestCases",  -- Use double quotes to preserve case
+                COALESCE(impacted_test_cases_count, 0) as impacted_test_cases_count,
                 COALESCE(jsonb_array_length(test_case_json->'test_cases'), 0) as test_case_count,
                 inputs->>'content' as document_content,
                 inputs->>'file_content' as file_content
@@ -77,6 +77,10 @@ def get_stories():
 
         
         # Get embedding timestamps and doc_content_text from LanceDB
+        print("DEBUG:get_stories: Connecting to LanceDB", {
+            'lance_db_path': Config.LANCE_DB_PATH,
+            'table_name': Config.TABLE_NAME_LANCE
+        })
         db = lancedb.connect(Config.LANCE_DB_PATH)
         table = db.open_table(Config.TABLE_NAME_LANCE)
         lance_data = table.to_pandas()
@@ -84,10 +88,17 @@ def get_stories():
         doc_content_texts = dict(zip(lance_data['storyID'], lance_data['doc_content_text']))
         
         # Execute query
+        print("DEBUG:get_stories: Executing Postgres query", {
+            'query': query,
+            'params': params
+        })
         with Config.get_postgres_connection() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
                 cursor.execute(query, params)
                 stories = cursor.fetchall()
+                print("DEBUG:get_stories: Query returned stories", {
+                    'stories_count': len(stories)
+                })
                 
                 # Get total count for pagination
                 count_query = """
@@ -102,6 +113,9 @@ def get_stories():
 
                 cursor.execute(count_query, count_params)
                 total = cursor.fetchone()[0]
+                print("DEBUG:get_stories: Total stories count", {
+                    'total': total
+                })
 
                 # Process results
                 result = {
@@ -142,15 +156,24 @@ def get_stories():
                     # Get document content from LanceDB's doc_content_text
                     story_dict['doc_content_text'] = doc_content_texts.get(story_dict['id'])
 
-                    # Ensure impactedTestCases is included with the correct case
-                    if 'impactedtestcases' in story_dict:
-                        story_dict['impactedTestCases'] = story_dict.pop('impactedtestcases')
-                    elif 'impactedTestCases' not in story_dict:
-                        story_dict['impactedTestCases'] = story_dict.get('impactedTestCases', 0)
+                    # Ensure impactedTestCases is included with the correct case.
+                    # psycopg2 DictCursor lowercases all column names regardless of SQL aliases.
+                    # The column is now aliased as 'impacted_test_cases_count' in the query.
+                    def _get_impact_count(d):
+                        for key in ('impactedtestcases', 'impactedTestCases', 'impacted_test_cases_count'):
+                            val = d.pop(key, None) if key in d else None
+                            if val is not None:
+                                return int(val)
+                        return 0
+                    story_dict['impactedTestCases'] = _get_impact_count(story_dict)
 
 
                     result['stories'].append(story_dict)
 
+                print("DEBUG:get_stories: Returning response", {
+                    'stories_returned': len(result['stories']),
+                    'pagination': result['pagination']
+                })
                 return jsonify(result), 200
 
     except Exception as e:
@@ -161,14 +184,18 @@ def get_stories():
 def get_story(story_id):
     """Get a specific story"""
     try:
+        print("DEBUG:get_story: Request received", {'story_id': story_id})
         if not story_id:
             return jsonify({'error': 'Story ID is required'}), 400
 
         db_service = get_db_service()
+        print("DEBUG:get_story: Fetching story from db_service")
         story = db_service.get_story(story_id)
         
         if story:
+            print("DEBUG:get_story: Story found", {'story_id': story_id})
             return jsonify(story)
+        print("DEBUG:get_story: Story not found", {'story_id': story_id})
         return jsonify({'error': f'Story not found: {story_id}'}), 404
     except Exception as e:
         print(f"Error getting story {story_id}: {str(e)}")
@@ -179,6 +206,7 @@ def search_stories():
     """Search for similar stories"""
     try:
         data = request.get_json()
+        print("DEBUG:search_stories: Request received", {'data': data})
         if not data or 'query' not in data:
             return jsonify({'error': 'Query is required'}), 400
             
@@ -192,7 +220,14 @@ def search_stories():
             limit = 5
             
         db_service = get_db_service()
+        print("DEBUG:search_stories: Calling db_service.search_similar_stories", {
+            'query': query,
+            'limit': limit
+        })
         results = db_service.search_similar_stories(query, limit)
+        print("DEBUG:search_stories: Returning results", {
+            'results_count': len(results) if isinstance(results, list) else 'n/a'
+        })
         return jsonify(results)
     except Exception as e:
         print(f"Error searching stories: {str(e)}")
@@ -202,9 +237,11 @@ def search_stories():
 def download_test_cases(story_id):
     """Download test cases for a story as Excel file"""
     try:
+        print("DEBUG:download_test_cases: Request received", {'story_id': story_id})
         db_service = get_db_service()
         
         # Get story details from LanceDB
+        print("DEBUG:download_test_cases: Fetching story details from db_service")
         story = db_service.get_story(story_id)
         if not story:
             return jsonify({
@@ -212,6 +249,7 @@ def download_test_cases(story_id):
             }), 404
 
         # Get test cases from PostgreSQL
+        print("DEBUG:download_test_cases: Querying Postgres for test_case_json")
         with psycopg2.connect(**db_service.postgres_config) as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
@@ -222,15 +260,22 @@ def download_test_cases(story_id):
                 result = cursor.fetchone()
 
                 if not result:
+                    print("DEBUG:download_test_cases: No test case row found", {'story_id': story_id})
                     return jsonify({
                         'error': f'No test cases found for story ID: {story_id}'
                     }), 404
 
                 # Parse the test cases JSON if it's a string
                 test_case_json = result[0]
+                print("DEBUG:download_test_cases: Raw test_case_json type", {
+                    'type': str(type(test_case_json))
+                })
                 if isinstance(test_case_json, str):
                     try:
                         test_case_json = json.loads(test_case_json)
+                        print("DEBUG:download_test_cases: Parsed test_case_json keys", {
+                            'keys': list(test_case_json.keys())
+                        })
                     except json.JSONDecodeError as e:
                         print(f"Error parsing test cases JSON: {str(e)}")
                         return jsonify({
@@ -241,13 +286,18 @@ def download_test_cases(story_id):
                 test_case_json = {
                     'storyID': story_id,
                     'storyDescription': result[1],
-                    'testcases': test_case_json['test_cases']
+                    'testcases': test_case_json.get('test_cases', [])
                 }
-                print(test_case_json)
+                print("DEBUG:download_test_cases: Prepared test_case_json for Excel", {
+                    'storyID': story_id,
+                    'testcases_count': len(test_case_json['testcases'])
+                })
 
                 # Generate Excel file
                 try:
+                    print("DEBUG:download_test_cases: Calling generate_excel")
                     excel_file = generate_excel(test_case_json)
+                    print("DEBUG:download_test_cases: Excel generation successful, sending file")
                     return send_file(
                         excel_file,
                         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -272,10 +322,11 @@ def download_test_cases(story_id):
 def get_story_testcases(story_id):
     """Get test cases for a specific story"""
     try:
-        print(f"Fetching test cases for story: {story_id}")
+        print(f"DEBUG:get_story_testcases: Request received for story {story_id}")
         db_service = get_db_service()
         
         # Get test cases from PostgreSQL
+        print("DEBUG:get_story_testcases: Querying Postgres for test_case_json")
         with psycopg2.connect(**db_service.postgres_config) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -285,36 +336,51 @@ def get_story_testcases(story_id):
                 """, (story_id,))
                 result = cur.fetchone()
 
+                print("DEBUG:get_story_testcases: Raw DB result exists?", {
+                    'has_result': bool(result),
+                    'story_id': story_id
+                })
+
                 if result and result[0]:
-                    print("Raw database result:", result)
+                    print("DEBUG:get_story_testcases: Raw database result", result)
                     # Parse the test cases JSON if it's a string
                     test_case_json = result[0]
+                    print("DEBUG:get_story_testcases: test_case_json type before parse", {
+                        'type': str(type(test_case_json))
+                    })
                     if isinstance(test_case_json, str):
                         try:
                             test_case_json = json.loads(test_case_json)
-                            print("Parsed JSON from string:", test_case_json)
+                            print("DEBUG:get_story_testcases: Parsed JSON from string", {
+                                'keys': list(test_case_json.keys())
+                            })
                         except json.JSONDecodeError as e:
                             print(f"Error parsing test cases JSON: {str(e)}")
                             return jsonify({
-                                'error': 'Invalid test cases data format'
+                                'error': 'Invalid test cases data format',
+                                'details': str(e)
                             }), 500
 
-                    print("Raw test case JSON:", test_case_json)
+                    print("DEBUG:get_story_testcases: Raw test case JSON object", test_case_json)
 
                     # Prepare data in the same format as the download endpoint
+                    testcases_list = test_case_json.get('test_cases', [])
                     response_data = {
                         'storyID': story_id,
                         'storyDescription': result[1],
                         'project_id': result[2],
-                        'testcases': test_case_json.get('test_cases', [])
+                        'testcases': testcases_list
                     }
 
-                    print("Processed response data:", response_data)
-                    print("Number of test cases:", len(response_data['testcases']))
+                    print("DEBUG:get_story_testcases: Processed response data meta", {
+                        'storyID': response_data['storyID'],
+                        'project_id': response_data['project_id'],
+                        'testcases_count': len(testcases_list)
+                    })
 
                     return jsonify(response_data)
                 
-                print(f"No test cases found for story {story_id}")
+                print(f"DEBUG:get_story_testcases: No test cases found for story {story_id}")
                 return jsonify({
                     'storyID': story_id,
                     'storyDescription': None,
@@ -324,7 +390,7 @@ def get_story_testcases(story_id):
 
     except Exception as e:
         print(f"Error getting test cases for story {story_id}: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
+        return jsonify({'error': 'Internal server error', 'details': str(e)}), 500
 
 @stories_bp.route('/next-reload', methods=['GET'])
 def get_next_reload():
@@ -337,18 +403,28 @@ def get_next_reload():
         if os.path.exists(next_reload_file):
             with open(next_reload_file, 'r') as f:
                 content = f.read().strip()
-                return content, 200
+                return jsonify({
+                    'next_reload': content,
+                    'source': 'file'
+                }), 200
         else:
             # If file doesn't exist, return current time + 5 minutes
             from datetime import datetime, timedelta
             next_time = datetime.now() + timedelta(minutes=5)
-            return next_time.isoformat(), 200
+            return jsonify({
+                'next_reload': next_time.isoformat(),
+                'source': 'fallback'
+            }), 200
     except Exception as e:
         print(f"Error reading next reload time: {str(e)}")
-        # Return current time + 5 minutes as fallback
+        # Return explicit error with a suggested fallback time
         from datetime import datetime, timedelta
         next_time = datetime.now() + timedelta(minutes=5)
-        return next_time.isoformat(), 200
+        return jsonify({
+            'error': 'Failed to read next reload time',
+            'details': str(e),
+            'fallback_next_reload': next_time.isoformat()
+        }), 500
 
 @stories_bp.route('/trigger-reload', methods=['POST'])
 def trigger_reload():
@@ -366,16 +442,28 @@ def rag_chat():
     """RAG chatbot endpoint: retrieves similar test cases, sends them as context to Gemini, returns generated test cases."""
     try:
         data = request.get_json()
+        print("DEBUG:rag_chat: Request received", {'data': data})
         if not data or 'query' not in data:
             return jsonify({'error': 'Query is required'}), 400
         user_query = data['query']
         # 1. Retrieve similar stories and their test cases
-        rag_results = Chat_RAG(user_query, top_k=3)
+        try:
+            print("DEBUG:rag_chat: Calling Chat_RAG", {'query': user_query})
+            rag_results = Chat_RAG(user_query, top_k=3)
+            print("DEBUG:rag_chat: Chat_RAG returned results", {
+                'results_count': len(rag_results) if isinstance(rag_results, list) else 'n/a'
+            })
+        except Exception as e:
+            print(f"❌ ERROR:rag_chat: Chat_RAG failed: {e}")
+            return jsonify({'error': 'Failed to retrieve similar stories', 'details': str(e)}), 500
         context_cases = []
         for res in rag_results:
             tc_json = res.get('test_case_json')
             if tc_json and isinstance(tc_json, dict) and 'test_cases' in tc_json:
                 context_cases.extend(tc_json['test_cases'])
+        print("DEBUG:rag_chat: Context cases collected", {
+            'context_cases_count': len(context_cases)
+        })
         if not context_cases:
             return jsonify({'error': 'No relevant test cases found.'}), 404
 
@@ -392,9 +480,16 @@ Now, based on the following user story, generate new, comprehensive test cases i
 """
 
         # 3. Call Gemini LLM using the configured object
-        response = Config.llm.invoke(prompt)
-        text = response.content.strip()
-        print("LLM raw output:", repr(text))
+        try:
+            print("DEBUG:rag_chat: Calling LLM via Config.llm.invoke")
+            response = Config.llm.invoke(prompt)
+            text = response.content.strip()
+            print("DEBUG:rag_chat: LLM raw output received", {
+                'length': len(text)
+            })
+        except Exception as e:
+            print(f"❌ ERROR:rag_chat: LLM invocation failed: {e}")
+            return jsonify({'error': 'Failed to generate test cases from LLM', 'details': str(e)}), 500
         # Clean triple backticks and ```json
         cleaned = text.strip()
         if cleaned.startswith('```json'):
@@ -406,18 +501,27 @@ Now, based on the following user story, generate new, comprehensive test cases i
         cleaned = cleaned.strip()
         import json
         try:
+            print("DEBUG:rag_chat: Attempting to parse LLM output as JSON")
             parsed = json.loads(cleaned)
+            print("DEBUG:rag_chat: Parsed LLM JSON type", {'type': str(type(parsed))})
             # If it's a list of test cases, return as JSON
             if isinstance(parsed, list):
+                print("DEBUG:rag_chat: Returning list of test cases", {
+                    'count': len(parsed)
+                })
                 return jsonify({'testCases': parsed})
             # If it's a dict with 'test_cases', return that
             if isinstance(parsed, dict) and 'test_cases' in parsed:
+                print("DEBUG:rag_chat: Returning dict['test_cases']", {
+                    'count': len(parsed['test_cases'])
+                })
                 return jsonify({'testCases': parsed['test_cases']})
             # Otherwise, return the parsed object
+            print("DEBUG:rag_chat: Returning parsed object without transformation")
             return jsonify({'testCases': parsed})
         except Exception as e:
             print("Failed to parse LLM output as JSON:", e)
-            return jsonify({'raw': cleaned, 'error': 'Failed to parse LLM output as JSON'}), 200
+            return jsonify({'raw': cleaned, 'error': 'Failed to parse LLM output as JSON', 'details': str(e)}), 200
     except Exception as e:
         print(f"Error in rag_chat: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -583,6 +687,33 @@ def upload_story():
                     os.makedirs(success_dir, exist_ok=True)
                     import shutil
                     shutil.move(file_path, os.path.join(success_dir, filename))
+                
+                # -------------------------------------------------------
+                # Run impact analysis in background thread:
+                # This finds all existing stories in the same project and
+                # updates their impacted_test_cases_count so the table
+                # immediately reflects how many test cases are affected.
+                # -------------------------------------------------------
+                import threading
+                def run_impact_analysis(new_story_id, proj_id):
+                    try:
+                        print(f"[ImpactAnalysis] Starting background impact analysis for story {new_story_id} in project {proj_id}")
+                        from app.LLM.impact_analyzer import analyze_test_case_impacts
+                        analyze_test_case_impacts(
+                            new_story_id=new_story_id,
+                            project_id=proj_id
+                        )
+                        print(f"[ImpactAnalysis] ✅ Background impact analysis completed for story {new_story_id}")
+                    except Exception as ia_err:
+                        print(f"[ImpactAnalysis] ❌ Background impact analysis failed for story {new_story_id}: {ia_err}")
+                
+                impact_thread = threading.Thread(
+                    target=run_impact_analysis,
+                    args=(story_id, project_id),
+                    daemon=True
+                )
+                impact_thread.start()
+                print(f"[Upload] Impact analysis thread started for story {story_id}")
                 
                 return jsonify({
                     'message': 'Story uploaded and test cases generated successfully',
@@ -794,6 +925,69 @@ async def trigger_impact_analysis():
         
     except Exception as e:
         print(f"❌ Error triggering impact analysis: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@stories_bp.route('/impacts/analyze-project', methods=['POST'])
+def trigger_project_impact_analysis():
+    """Trigger impact analysis for ALL stories in a project (background thread).
+    Refreshes impacted_test_cases_count for each story so the table shows
+    accurate non-zero counts after a new story is uploaded.
+    """
+    try:
+        data = request.get_json()
+        project_id = data.get('project_id')
+        
+        if not project_id:
+            return jsonify({'error': 'project_id is required'}), 400
+        
+        # Get all stories with test cases in this project
+        with Config.get_postgres_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+                cursor.execute("""
+                    SELECT story_id FROM test_cases
+                    WHERE project_id = %s AND test_case_generated = TRUE
+                    ORDER BY created_on ASC
+                """, (project_id,))
+                stories = [row['story_id'] for row in cursor.fetchall()]
+        
+        if not stories:
+            return jsonify({
+                'message': 'No stories with test cases found in project',
+                'project_id': project_id,
+                'stories_queued': 0
+            }), 200
+        
+        # Run analysis in background thread
+        import threading
+        def run_all_impact_analyses(story_list, proj_id):
+            try:
+                print(f"[ImpactAnalysis] Starting project-wide impact analysis for {len(story_list)} stories in project {proj_id}")
+                from app.LLM.impact_analyzer import analyze_test_case_impacts
+                for sid in story_list:
+                    try:
+                        analyze_test_case_impacts(new_story_id=sid, project_id=proj_id)
+                        print(f"[ImpactAnalysis] Completed impact analysis for story {sid}")
+                    except Exception as story_err:
+                        print(f"[ImpactAnalysis] Error analyzing story {sid}: {story_err}")
+                print(f"[ImpactAnalysis] Project-wide impact analysis completed for project {proj_id}")
+            except Exception as e:
+                print(f"[ImpactAnalysis] Project-wide impact analysis failed: {e}")
+        
+        thread = threading.Thread(
+            target=run_all_impact_analyses,
+            args=(stories, project_id),
+            daemon=True
+        )
+        thread.start()
+        
+        return jsonify({
+            'message': f'Impact analysis started for {len(stories)} stories in background',
+            'project_id': project_id,
+            'stories_queued': len(stories)
+        }), 202
+        
+    except Exception as e:
+        print(f"Error triggering project impact analysis: {e}")
         return jsonify({'error': str(e)}), 500
 
 @stories_bp.route('/<story_id>/test-cases/<test_case_id>', methods=['GET'])
@@ -1075,7 +1269,23 @@ def get_story_impact_details(story_id):
                 test_cases = cursor.fetchall()
 
                 # Calculate summary statistics
-                total_test_cases = len(json.loads(story_info['test_case_json'])['test_cases'])
+                raw_tc_json = story_info['test_case_json']
+                try:
+                    if isinstance(raw_tc_json, str):
+                        parsed_tc_json = json.loads(raw_tc_json)
+                    elif isinstance(raw_tc_json, dict):
+                        parsed_tc_json = raw_tc_json
+                    else:
+                        print(f"DEBUG:get_story_impact_details: Unexpected test_case_json type: {type(raw_tc_json)}")
+                        parsed_tc_json = {'test_cases': []}
+                except Exception as e:
+                    print(f"DEBUG:get_story_impact_details: Error parsing test_case_json: {e}")
+                    return jsonify({
+                        'error': 'Invalid test cases data format for story',
+                        'details': str(e)
+                    }), 500
+
+                total_test_cases = len(parsed_tc_json.get('test_cases', []))
                 impacted_test_cases = sum(1 for tc in test_cases if tc['is_impacted'])
                 severity_counts = {
                     'high': sum(1 for tc in test_cases if tc['highest_severity'] == 'high'),

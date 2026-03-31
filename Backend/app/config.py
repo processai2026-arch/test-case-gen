@@ -1,17 +1,18 @@
 import os
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 import psycopg2
 
 load_dotenv()
 
 EMBEDDING_MODEL = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
 
-llm = ChatGoogleGenerativeAI(
-    model="models/gemini-2.0-flash",
+# Main LLM
+llm = ChatGroq(
+    model="llama-3.1-8b-instant",
     temperature=0.3,
-    google_api_key=os.environ["GOOGLE_API_KEY"]
+    groq_api_key=os.environ["GROQ_API_KEY"]
 )
 
 class Config:
@@ -21,30 +22,31 @@ class Config:
     POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', 'admin')
     POSTGRES_HOST = os.getenv('POSTGRES_HOST', 'localhost')
     POSTGRES_PORT = os.getenv('POSTGRES_PORT', '5432')
-    
+
     LANCE_DB_PATH = os.getenv('LANCE_DB_PATH', './data/lance_db')
     TABLE_NAME_LANCE = os.getenv('TABLE_NAME_LANCE', 'user_stories')
+
     EMBEDDING_MODEL = EMBEDDING_MODEL
 
-    # Original LLM instance
+    # Main LLM
     llm = llm
 
-    # Additional LLM for impact analysis
-    llm_impact = ChatGoogleGenerativeAI(
-        model="models/gemini-2.0-flash",
+    # LLM for impact analysis
+    llm_impact = ChatGroq(
+        model="llama-3.1-8b-instant",
         temperature=0.3,
-        google_api_key=os.environ.get("GOOGLE_API_KEY_IMPACT", os.environ["GOOGLE_API_KEY"])
+        groq_api_key=os.environ.get("GROQ_API_KEY_IMPACT", os.environ["GROQ_API_KEY"])
     )
 
     # Test case generation configuration
     TEST_CASE_COUNTS = {
-        "positive": int(os.getenv('TEST_CASE_COUNT_POSITIVE', '50')),  # Core functionality, happy paths
-        "negative": int(os.getenv('TEST_CASE_COUNT_NEGATIVE', '30')),   # Error handling, invalid inputs
-        "boundary": int(os.getenv('TEST_CASE_COUNT_BOUNDARY', '10')),   # Edge cases, limits
-        "security": int(os.getenv('TEST_CASE_COUNT_SECURITY', '10')),   # Security tests
-        "performance": int(os.getenv('TEST_CASE_COUNT_PERFORMANCE', '10'))  # Performance tests
+        "positive": int(os.getenv('TEST_CASE_COUNT_POSITIVE', '50')),
+        "negative": int(os.getenv('TEST_CASE_COUNT_NEGATIVE', '30')),
+        "boundary": int(os.getenv('TEST_CASE_COUNT_BOUNDARY', '10')),
+        "security": int(os.getenv('TEST_CASE_COUNT_SECURITY', '10')),
+        "performance": int(os.getenv('TEST_CASE_COUNT_PERFORMANCE', '10'))
     }
-    
+
     @classmethod
     def get_postgres_connection(cls):
         return psycopg2.connect(
@@ -54,7 +56,7 @@ class Config:
             host=cls.POSTGRES_HOST,
             port=cls.POSTGRES_PORT
         )
-    
+
     @classmethod
     def postgres_config(cls):
         return {
@@ -81,4 +83,4 @@ config = {
     'production': ProductionConfig,
     'testing': TestingConfig,
     'default': DevelopmentConfig
-} 
+}

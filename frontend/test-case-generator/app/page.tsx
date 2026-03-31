@@ -96,10 +96,17 @@ function NextReloadBanner() {
   const fetchNextReload = async () => {
     try {
       const response = await fetch("http://127.0.0.1:5001/api/scheduler/next-reload");
-      const text = await response.text();
-      const date = new Date(text.trim());
-      if (!isNaN(date.getTime())) {
-        setNextReload(date);
+      // Backend may return either plain ISO text or JSON: { next_reload: ISOString }
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = await response.json();
+        const value = data?.next_reload ?? data?.nextReload ?? null;
+        const date = value ? new Date(String(value).trim()) : null;
+        if (date && !isNaN(date.getTime())) setNextReload(date);
+      } else {
+        const text = await response.text();
+        const date = new Date(text.trim());
+        if (!isNaN(date.getTime())) setNextReload(date);
       }
     } catch (error) {
       console.error("Error fetching next reload time:", error);
@@ -852,10 +859,10 @@ export default function TestCaseGenerator() {
       <header className="fixed top-0 left-0 w-full z-50 bg-background shadow-sm border-b border-border px-4 md:px-8 py-4">
         <div className="flex justify-between items-center">
           <div className="flex-shrink-0">
-            <img src="/Logo-New.svg" alt="Innova Solutions" className="h-12 w-auto" />
+            <img src="" alt="" className="h-12 w-auto" />
           </div>
           <div className="text-center">
-            <h1 className="text-3xl font-bold text-primary">Test Forge AI</h1>
+            <h1 className="text-3xl font-bold text-primary">Test Case Generation</h1>
             <p className="text-sm text-muted-foreground font-semibold mt-1">Powered by Gen AI</p>
           </div>
           <div className="flex-shrink-0 flex items-center space-x-4">
@@ -865,15 +872,7 @@ export default function TestCaseGenerator() {
               </div>
               <div className="text-sm text-muted-foreground">{new Date().toLocaleDateString()}</div>
             </div>
-            <div className="bg-blue-500 text-white px-4 py-2 rounded-full flex items-center space-x-2">
-              <div className="w-6 h-6 bg-white/20 rounded-full flex items-center justify-center">
-                <Triangle className="h-3 w-3 fill-white" />
-              </div>
-              <div className="text-sm font-bold">
-                <div className="text-xs opacity-90">Team</div>
-                <div>DELTA</div>
-              </div>
-            </div>
+            
           </div>
         </div>
       </header>
@@ -1417,7 +1416,7 @@ export default function TestCaseGenerator() {
       <footer className="mt-6">
         <div className="bg-gray-800 py-3 text-center text-gray-300 text-sm">
           <div className="w-full">
-            © 2025 Innova Solutions. All Rights Reserved.
+            
           </div>
         </div>
       </footer>

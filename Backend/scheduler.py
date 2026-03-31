@@ -110,10 +110,29 @@ def scheduled_job():
         print("⏳ [Scheduler] Waiting 2 seconds for LanceDB to update...")
         time.sleep(2)
         
-        # Step 2: Generate test cases for all stories
+       # Step 2: Generate test cases for all stories
         print("🧠 [Scheduler] Step 2: Generating test cases for all stories...")
         generate_test_cases_for_all_stories()
-        
+
+        # Step 3: Run impact analysis
+        print("🔍 [Scheduler] Step 3: Running impact analysis...")
+
+        from app.LLM.impact_analyzer import analyze_test_case_impacts
+        from app.models.db_service import DatabaseService
+
+        db_service = DatabaseService._instance
+
+        stories = db_service.get_all_stories()
+
+        for story in stories:
+            try:
+                analyze_test_case_impacts(
+                    new_story_id=story["id"],
+                    project_id=story["project_id"]
+                )
+            except Exception as e:
+                print(f"[Scheduler] Impact analysis failed for {story['id']}: {e}")
+                
         # Calculate and store next reload time
         next_time = datetime.now() + timedelta(minutes=5)
         write_next_reload_time(next_time)
